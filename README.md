@@ -139,6 +139,59 @@ go run . -bench
 - Best for **job queues and work-stealing** patterns where throughput matters more than
   strict turn-taking and you can tolerate some workers finding no work.
 
+#### What happens inside PostgreSQL with 50 customers
+
+##### FOR UPDATE — one queue, one lane
+
+Every goroutine runs the same query:
+
+```sql
+SELECT seat_id FROM seats WHERE status = 'available' LIMIT 1 FOR UPDATE
+```
+
+Without `ORDER BY`, PostgreSQL returns the first physical row — **seat 1** — to everyone.
+
+- Goroutine 1 locks seat 1 → runs → commits → releases
+- Goroutine 2 tried to lock seat 1, was **blocked**, now wakes up, sees seat 1 is `booked`, re-scans, gets seat 2
+- Goroutine 3 was blocked behind goroutine 2, now wakes up...
+
+All 50 goroutines form a **serial chain**. Even though they were fired concurrently, they execute one at a time.
+
+```
+Time →
+G1:  [---txn---]
+G2:            [---txn---]
+G3:                      [---txn---]
+...
+G50:                                         [---txn---]
+
+Wall clock = 50 × one transaction time = ~59ms
+```
+
+##### FOR UPDATE SKIP LOCKED — 50 lanes
+
+- Goroutine 1 locks seat 1
+- Goroutine 2 sees seat 1 locked → **skips immediately** → locks seat 2
+- Goroutine 3 sees seat 1, 2 locked → skips → locks seat 3
+- ...all happening **at the same time**
+
+```
+Time →
+G1:  [---txn---]
+G2:  [---txn---]
+G3:  [---txn---]
+...
+G50: [---txn---]
+
+Wall clock = 1 × one transaction time = ~10ms
+```
+
+The 50 goroutines run truly in parallel. Wall-clock time is roughly the cost of a **single transaction**, not 50.
+
+##### Why they converge at 500 customers
+
+With 500 goroutines and only 100 seats, once all 100 seats are locked, the remaining 400 goroutines scan the entire table, skip all 100 locked rows, find nothing, and return empty. That sequential skip-scan of 100 rows is non-trivial work, and 400 goroutines doing it simultaneously creates its own pressure — which is why 148ms approaches FOR UPDATE's 160ms.
+
 ### FOR UPDATE NOWAIT — broken without retry logic
 
 - Consistently books **only 1 seat** regardless of how many customers are sent.
