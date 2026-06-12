@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(go mod *)",
+      "Bash(find /Users/ayush -name \"go\" -type f 2>/dev/null | head -5; find /usr -name \"go\" -type f 2>/dev/null | head -5; ls ~/go/bin/ 2>/dev/null)",
+      "Read(//Users/ayush/**)",
+      "Read(//usr/**)",
+      "Read(//Users/ayush/go/**)",
+      "Read(//opt/homebrew/bin/**)",
+      "Bash(/opt/homebrew/bin/go version *)",
+      "Read(//opt/homebrew/Cellar/**)"
+    ]
+  }
+}
