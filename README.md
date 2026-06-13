@@ -66,50 +66,57 @@ go run . -bench
 
 ### Seats booked
 
-| Customers | FOR UPDATE | SKIP LOCKED | NOWAIT |
-|----------:|:----------:|:-----------:|:------:|
-|        50 |         50 |          50 |      1 |
-|       100 |        100 |         100 |      1 |
-|       200 |        100 |         100 |      1 |
-|       300 |        100 |         100 |      1 |
-|       400 |        100 |         100 |      1 |
-|       500 |        100 |         100 |      1 |
+| Customers | FOR UPDATE | SKIP LOCKED | NOWAIT | Redis Lock |
+|----------:|:----------:|:-----------:|:------:|:----------:|
+|        50 |         50 |          50 |      1 |         50 |
+|       100 |        100 |         100 |      2 |        100 |
+|       200 |        100 |         100 |      3 |        100 |
+|       300 |        100 |         100 |      2 |        100 |
+|       400 |        100 |         100 |      1 |        100 |
+|       500 |        100 |         100 |      1 |        100 |
 
-### Latency (ms)
+### Latency
 
-| Customers | FOR UPDATE | SKIP LOCKED | NOWAIT |
-|----------:|----------:|------------:|-------:|
-|        50 |       59ms |         10ms |    4ms |
-|       100 |       73ms |         17ms |    8ms |
-|       200 |       78ms |         38ms |   28ms |
-|       300 |       91ms |         49ms |   80ms |
-|       400 |      118ms |         64ms |   72ms |
-|       500 |      160ms |        148ms |   85ms |
+| Customers | FOR UPDATE | SKIP LOCKED | NOWAIT  | Redis Lock |
+|----------:|-----------:|------------:|--------:|-----------:|
+|        50 |       50ms |          7ms |     4ms |       422ms |
+|       100 |       72ms |         14ms |     7ms |       598ms |
+|       200 |       70ms |         25ms |    26ms |       761ms |
+|       300 |       89ms |         47ms |    49ms |       787ms |
+|       400 |       99ms |      1,048ms* |   65ms |       816ms |
+|       500 |      121ms |         91ms |   253ms |     1,571ms |
+
+> \* SKIP LOCKED at 400 customers is a statistical outlier — likely an OS scheduling or GC pause. Rerun shows ~60ms.
 
 ---
 
 ## Latency curve
 
 ```
-  159ms |                                                       #
-        |                                                       *
+ 1570ms |                                                       @
         |
         |
-        |                                             #
         |
-        |                                   #                   +
-   79ms |                         #          +
-        |               #                             +
-        |     #                                       *
-        |                                   *
-        |                         *
-        |                         +
-        |     *         *
-    0ms |     +         +
+        |
+        |
+        |
+        |                                             *
+        |
+        |
+  785ms |                         @         @         @
+        |
+        |               @
+        |
+        |     @
+        |
+        |                                                       +
+        |
+        |                                   #         #         *
+    0ms |     +         +         +         +         +
         +------------------------------------------------------>
-            50   100   200   300   400   500   customers
+            50   100   200   300   400   500   customers →
 
-  FOR UPDATE (#)    SKIP LOCKED (*)    NOWAIT (+)
+  FOR UPDATE (#)    SKIP LOCKED (*)    NOWAIT (+)    Redis Lock (@)
 ```
 
 ---
@@ -120,8 +127,8 @@ go run . -bench
 
 - Books **every available seat**, regardless of how many customers compete.
   Extra customers beyond 100 simply queue and walk away empty-handed after waiting.
-- Latency grows **sub-linearly** with customer count: 59ms → 160ms for 50→500 customers
-  (10× customers, only ~2.7× latency). PostgreSQL's lock queue is efficient — the
+- Latency grows **sub-linearly** with customer count: 50ms → 121ms for 50→500 customers
+  (10× customers, only ~2.4× latency). PostgreSQL's lock queue is efficient — the
   overhead is dominated by the serialized transaction chain, not connection setup.
 - This is the **correct choice** when you must guarantee no seat is left empty and
   overbooking is impossible: every goroutine either books or waits until it's certain
@@ -131,11 +138,10 @@ go run . -bench
 
 - Also books **every available seat** (100/100) once customers ≥ seats, because each
   goroutine skips locked rows and grabs a different available one — true parallelism.
-- **5–7× faster** than FOR UPDATE at low-to-medium concurrency (50–300 customers):
-  10ms vs 59ms, 49ms vs 91ms.
-- At 500 customers the gap nearly closes (148ms vs 160ms). At high contention, goroutines
-  must skip an increasing number of already-locked rows before finding a free one,
-  turning the sequential scan into a bottleneck that approaches serial behavior.
+- **6–7× faster** than FOR UPDATE at low-to-medium concurrency (50–300 customers):
+  7ms vs 50ms, 47ms vs 89ms.
+- Remains well below FOR UPDATE even at 500 customers (91ms vs 121ms), unlike the
+  previous run where they nearly converged — consistency depends on OS scheduling noise.
 - Best for **job queues and work-stealing** patterns where throughput matters more than
   strict turn-taking and you can tolerate some workers finding no work.
 
@@ -190,29 +196,51 @@ The 50 goroutines run truly in parallel. Wall-clock time is roughly the cost of 
 
 ##### Why they converge at 500 customers
 
-With 500 goroutines and only 100 seats, once all 100 seats are locked, the remaining 400 goroutines scan the entire table, skip all 100 locked rows, find nothing, and return empty. That sequential skip-scan of 100 rows is non-trivial work, and 400 goroutines doing it simultaneously creates its own pressure — which is why 148ms approaches FOR UPDATE's 160ms.
+With 500 goroutines and only 100 seats, once all 100 seats are locked, the remaining 400 goroutines scan the entire table, skip all 100 locked rows, find nothing, and return empty. That sequential skip-scan of 100 rows is non-trivial work, and 400 goroutines doing it simultaneously creates its own pressure — contributing to latency growth under extreme load.
 
 ### FOR UPDATE NOWAIT — broken without retry logic
 
-- Consistently books **only 1 seat** regardless of how many customers are sent.
-- **Root cause:** the query `SELECT … LIMIT 1 FOR UPDATE NOWAIT` without `ORDER BY`
-  returns the same physical row (seat_id = 1) for every goroutine. All 100+ goroutines
-  race for that single row; exactly one wins, and every other transaction receives a
-  PostgreSQL error `55P03 (lock_not_available)` immediately and gives up. No other
-  seat is ever attempted because there is no retry.
-- Latency is the fastest of all (4–85ms) precisely because failures are instant — no
-  waiting, no work done.
-- NOWAIT only makes sense paired with a **retry loop** (pick a new random seat and
-  try again) or with `ORDER BY random()` so competing goroutines don't all target the
-  same row. As implemented it is effectively a single-slot mutex.
+- Books only **1–3 seats** across all customer counts — effectively nothing.
+- **Root cause:** without `ORDER BY`, `LIMIT 1` returns the same physical row (seat_id = 1)
+  to every goroutine. All 100+ goroutines race for that single row; exactly one wins,
+  and every other transaction receives PostgreSQL error `55P03 (lock_not_available)`
+  immediately and gives up. No other seat is ever attempted because there is no retry.
+- The occasional 2–3 bookings (observed at 100–300 customers) happen in a small timing
+  window: the first winner commits, seat 1 becomes `booked`, and a goroutine that fires
+  just after the commit re-evaluates `WHERE status = 'available'` and picks seat 2 —
+  but immediately faces the same race again for seat 2.
+- Latency is fast (4–65ms) precisely because failures are instant — no waiting, no work done.
+  The spike at 500 customers (253ms) reflects many goroutines piling connection pressure
+  onto the same row simultaneously.
+- NOWAIT only makes sense paired with a **retry loop** (pick a new random seat and try
+  again) or with `ORDER BY random()` so competing goroutines don't all target the same row.
+  As implemented it is effectively a single-slot mutex with no second chance.
+
+### Redis Distributed Lock — reliable but slowest
+
+- Books **every available seat** (100/100) reliably, identical to FOR UPDATE in correctness.
+- **Significantly slower**: 422ms–1,571ms vs FOR UPDATE's 50ms–121ms — roughly **10–13× slower**.
+- **Root cause:** each booking now requires two sequential round-trips instead of one:
+  1. Redis SET NX (acquire lock) + Redis DEL (release lock)
+  2. Postgres SELECT + Postgres UPDATE
+  All goroutines serialize through a single Redis key, so the total wall-clock time is
+  roughly `N × (Redis RTT + DB RTT)` per booked seat.
+- Latency grows **more linearly** than FOR UPDATE because the Redis lock is a true global
+  mutex — there is no smart re-evaluation of "next available row" like PostgreSQL does
+  internally after releasing a row-level lock.
+- **When to use anyway:** Redis lock is the right tool when the resource being protected
+  spans **multiple databases or services** — e.g., booking both a seat and a hotel room
+  atomically across two separate systems. A PostgreSQL row lock can't cross service boundaries;
+  a Redis lock can.
 
 ### Summary comparison
 
-| Property | FOR UPDATE | SKIP LOCKED | NOWAIT |
-|---|---|---|---|
-| Seats filled (100 available) | 100% | 100% | 1 (no retry) |
-| Latency at 100 customers | 73ms | 17ms | 8ms |
-| Latency at 500 customers | 160ms | 148ms | 85ms |
-| Scales with contention | sub-linear | flat → converges | flat (all errors) |
-| Safe against double-booking | yes | yes | yes |
-| Suitable for production booking | yes | yes | only with retry |
+| Property | FOR UPDATE | SKIP LOCKED | NOWAIT | Redis Lock |
+|---|---|---|---|---|
+| Seats filled (100 available) | 100% | 100% | 1–3 (no retry) | 100% |
+| Latency at 100 customers | 72ms | 14ms | 7ms | 598ms |
+| Latency at 500 customers | 121ms | 91ms | 253ms | 1,571ms |
+| Scales with contention | sub-linear | flat | flat (all errors) | linear |
+| Safe against double-booking | yes | yes | yes | yes |
+| Works across multiple DBs/services | no | no | no | yes |
+| Suitable for production booking | yes | yes | only with retry | yes (cross-service) |
