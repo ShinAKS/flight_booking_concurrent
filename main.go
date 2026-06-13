@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"flag"
 	"fmt"
@@ -8,7 +9,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-redsync/redsync/v4"
+	"github.com/go-redsync/redsync/v4/redis/goredis/v9"
 	_ "github.com/lib/pq"
+	goredislib "github.com/redis/go-redis/v9"
 )
 
 type LockStrategy int
@@ -17,6 +21,7 @@ const (
 	ForUpdate           LockStrategy = iota
 	ForUpdateSkipLocked
 	ForUpdateNoWait
+	RedisLock
 )
 
 func (s LockStrategy) String() string {
@@ -27,6 +32,8 @@ func (s LockStrategy) String() string {
 		return "FOR UPDATE SKIP LOCKED"
 	case ForUpdateNoWait:
 		return "FOR UPDATE NOWAIT"
+	case RedisLock:
+		return "Redis Distributed Lock"
 	}
 	return "unknown"
 }
@@ -49,7 +56,8 @@ type BookingResult struct {
 	Err        error
 }
 
-func bookSeat(db *sql.DB, customerID int, strategy LockStrategy) BookingResult {
+// bookSeatPG handles FOR UPDATE / SKIP LOCKED / NOWAIT — all DB-level locking.
+func bookSeatPG(db *sql.DB, customerID int, strategy LockStrategy) BookingResult {
 	tx, err := db.Begin()
 	if err != nil {
 		return BookingResult{CustomerID: customerID, Err: err}
@@ -86,7 +94,41 @@ func bookSeat(db *sql.DB, customerID int, strategy LockStrategy) BookingResult {
 	return BookingResult{CustomerID: customerID, SeatID: seatID}
 }
 
-func runBookings(db *sql.DB, numCustomers int, strategy LockStrategy) ([]BookingResult, time.Duration) {
+// bookSeatRedis holds a distributed Redis mutex for the entire find+book operation.
+// No DB-level row lock is used; correctness is guaranteed by the mutex serializing access.
+func bookSeatRedis(db *sql.DB, rs *redsync.Redsync, customerID int) BookingResult {
+	mutex := rs.NewMutex("flight-booking-lock",
+		redsync.WithExpiry(30*time.Second),
+		redsync.WithTries(2000),
+		redsync.WithRetryDelay(10*time.Millisecond),
+	)
+
+	if err := mutex.LockContext(context.Background()); err != nil {
+		return BookingResult{CustomerID: customerID, Err: fmt.Errorf("redis lock: %w", err)}
+	}
+	defer mutex.Unlock() //nolint
+
+	var seatID int
+	err := db.QueryRow(`SELECT seat_id FROM seats WHERE status = 'available' LIMIT 1`).Scan(&seatID)
+	if err == sql.ErrNoRows {
+		return BookingResult{CustomerID: customerID, SeatID: 0}
+	}
+	if err != nil {
+		return BookingResult{CustomerID: customerID, Err: err}
+	}
+
+	_, err = db.Exec(
+		`UPDATE seats SET status = 'booked', customer_id = $1 WHERE seat_id = $2`,
+		customerID, seatID,
+	)
+	if err != nil {
+		return BookingResult{CustomerID: customerID, Err: err}
+	}
+
+	return BookingResult{CustomerID: customerID, SeatID: seatID}
+}
+
+func runBookings(db *sql.DB, rs *redsync.Redsync, numCustomers int, strategy LockStrategy) ([]BookingResult, time.Duration) {
 	results := make([]BookingResult, numCustomers)
 	var wg sync.WaitGroup
 
@@ -95,7 +137,11 @@ func runBookings(db *sql.DB, numCustomers int, strategy LockStrategy) ([]Booking
 		wg.Add(1)
 		go func(cid int) {
 			defer wg.Done()
-			results[cid-1] = bookSeat(db, cid, strategy)
+			if strategy == RedisLock {
+				results[cid-1] = bookSeatRedis(db, rs, cid)
+			} else {
+				results[cid-1] = bookSeatPG(db, cid, strategy)
+			}
 		}(i)
 	}
 	wg.Wait()
@@ -181,7 +227,8 @@ func chooseStrategy() LockStrategy {
 	fmt.Println("  1) FOR UPDATE")
 	fmt.Println("  2) FOR UPDATE SKIP LOCKED")
 	fmt.Println("  3) FOR UPDATE NOWAIT")
-	fmt.Print("Enter choice [1-3]: ")
+	fmt.Println("  4) Redis Distributed Lock")
+	fmt.Print("Enter choice [1-4]: ")
 
 	var choice int
 	fmt.Scan(&choice)
@@ -193,6 +240,8 @@ func chooseStrategy() LockStrategy {
 		return ForUpdateSkipLocked
 	case 3:
 		return ForUpdateNoWait
+	case 4:
+		return RedisLock
 	default:
 		fmt.Println("Invalid choice, defaulting to FOR UPDATE")
 		return ForUpdate
@@ -204,11 +253,9 @@ type cell struct {
 	elapsed time.Duration
 }
 
-// runBench runs all three strategies across the given customer counts and prints a comparison table.
-func runBench(db *sql.DB, counts []int) {
-	strategies := []LockStrategy{ForUpdate, ForUpdateSkipLocked, ForUpdateNoWait}
+func runBench(db *sql.DB, rdb *goredislib.Client, rs *redsync.Redsync, counts []int) {
+	strategies := []LockStrategy{ForUpdate, ForUpdateSkipLocked, ForUpdateNoWait, RedisLock}
 
-	// results[strategy][countIndex]
 	table := make([][]cell, len(strategies))
 	for i := range table {
 		table[i] = make([]cell, len(counts))
@@ -221,28 +268,29 @@ func runBench(db *sql.DB, counts []int) {
 				fmt.Println("reset error:", err)
 				return
 			}
-			results, elapsed := runBookings(db, n, strat)
+			if strat == RedisLock {
+				clearRedisLock(rdb)
+			}
+			results, elapsed := runBookings(db, rs, n, strat)
 			booked, _, _ := countResults(results)
 			table[si][ci] = cell{booked, elapsed}
 			fmt.Printf("  customers=%-4d  booked=%-3d  time=%s\n", n, booked, elapsed.Round(time.Millisecond))
 		}
 	}
 
-	// Summary table
 	fmt.Println()
 	fmt.Println("=== Benchmark Summary ===")
 	fmt.Println()
-	header := fmt.Sprintf("%-24s", "Strategy")
+	header := fmt.Sprintf("%-26s", "Strategy")
 	for _, n := range counts {
 		header += fmt.Sprintf("  %6d", n)
 	}
 	fmt.Println(header)
 	fmt.Println(repeatStr("-", len(header)+4))
 
-	labels := []string{"Booked (FU)", "Booked (SL)", "Booked (NW)"}
-	for si, strat := range strategies {
-		_ = strat
-		row := fmt.Sprintf("%-24s", labels[si]+" seats")
+	bookedLabels := []string{"Booked (FU)", "Booked (SL)", "Booked (NW)", "Booked (Redis)"}
+	for si := range strategies {
+		row := fmt.Sprintf("%-26s", bookedLabels[si]+" seats")
 		for ci := range counts {
 			row += fmt.Sprintf("  %6d", table[si][ci].booked)
 		}
@@ -250,16 +298,15 @@ func runBench(db *sql.DB, counts []int) {
 	}
 
 	fmt.Println()
-	labels2 := []string{"Time (FU)", "Time (SL)", "Time (NW)"}
+	timeLabels := []string{"Time (FU)", "Time (SL)", "Time (NW)", "Time (Redis)"}
 	for si := range strategies {
-		row := fmt.Sprintf("%-24s", labels2[si])
+		row := fmt.Sprintf("%-26s", timeLabels[si])
 		for ci := range counts {
 			row += fmt.Sprintf("  %5dms", table[si][ci].elapsed.Milliseconds())
 		}
 		fmt.Println(row)
 	}
 
-	// ASCII latency curve
 	fmt.Println()
 	fmt.Println("=== Latency Curve (ms) ===")
 	fmt.Println()
@@ -270,7 +317,6 @@ func printASCIICurve(counts []int, table [][]cell) {
 	const height = 20
 	const width = 60
 
-	// Find max latency for scaling
 	var maxMs int64
 	for _, row := range table {
 		for _, c := range row {
@@ -283,10 +329,9 @@ func printASCIICurve(counts []int, table [][]cell) {
 		maxMs = 1
 	}
 
-	symbols := []string{"#", "*", "+"}
-	names := []string{"FOR UPDATE (#)", "SKIP LOCKED (*)", "NOWAIT (+)"}
+	symbols := []byte{'#', '*', '+', '@'}
+	names := []string{"FOR UPDATE (#)", "SKIP LOCKED (*)", "NOWAIT (+)", "Redis Lock (@)"}
 
-	// Build grid
 	grid := make([][]byte, height)
 	for i := range grid {
 		grid[i] = make([]byte, width)
@@ -296,7 +341,6 @@ func printASCIICurve(counts []int, table [][]cell) {
 	}
 
 	colWidth := width / len(counts)
-
 	for si, row := range table {
 		for ci, c := range row {
 			ms := c.elapsed.Milliseconds()
@@ -306,12 +350,11 @@ func printASCIICurve(counts []int, table [][]cell) {
 				y = 0
 			}
 			if x < width {
-				grid[y][x] = symbols[si][0]
+				grid[y][x] = symbols[si]
 			}
 		}
 	}
 
-	// Print Y-axis + grid
 	for y, row := range grid {
 		if y == 0 {
 			fmt.Printf("%5dms |%s\n", maxMs, string(row))
@@ -324,14 +367,13 @@ func printASCIICurve(counts []int, table [][]cell) {
 		}
 	}
 
-	// X-axis
 	fmt.Printf("       +%s\n", repeatStr("-", width))
-	xLabel := "       "
+	xLabel := "        "
 	for _, n := range counts {
-		xLabel += fmt.Sprintf(" %5d", n)
+		xLabel += fmt.Sprintf("%6d", n)
 	}
 	fmt.Println(xLabel)
-	fmt.Println("                         customers →")
+	fmt.Println("                           customers →")
 	fmt.Println()
 	for _, name := range names {
 		fmt.Printf("  %s\n", name)
@@ -339,21 +381,39 @@ func printASCIICurve(counts []int, table [][]cell) {
 }
 
 func repeatStr(s string, n int) string {
-	result := ""
-	for i := 0; i < n; i++ {
-		result += s
+	out := make([]byte, n*len(s))
+	for i := range out {
+		out[i] = s[0]
 	}
-	return result
+	return string(out)
+}
+
+func newRedisClient() *goredislib.Client {
+	host := getenv("REDIS_HOST", "localhost")
+	port := getenv("REDIS_PORT", "6379")
+	return goredislib.NewClient(&goredislib.Options{
+		Addr: fmt.Sprintf("%s:%s", host, port),
+	})
+}
+
+func newRedisSync(client *goredislib.Client) *redsync.Redsync {
+	return redsync.New(goredis.NewPool(client))
+}
+
+// clearRedisLock deletes any stale lock key left by a previous crashed run.
+func clearRedisLock(client *goredislib.Client) {
+	client.Del(context.Background(), "flight-booking-lock")
 }
 
 func dsn() string {
-	host := getenv("DB_HOST", "localhost")
-	port := getenv("DB_PORT", "5432")
-	user := getenv("DB_USER", "postgres")
-	pass := getenv("DB_PASS", "postgres")
-	dbname := getenv("DB_NAME", "flight_booking")
-	return fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
-		host, port, user, pass, dbname)
+	return fmt.Sprintf(
+		"host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
+		getenv("DB_HOST", "localhost"),
+		getenv("DB_PORT", "5432"),
+		getenv("DB_USER", "postgres"),
+		getenv("DB_PASS", "postgres"),
+		getenv("DB_NAME", "flight_booking"),
+	)
 }
 
 func getenv(key, fallback string) string {
@@ -374,7 +434,6 @@ func main() {
 	}
 	defer db.Close()
 
-	// Large enough pool for 500 concurrent goroutines
 	db.SetMaxOpenConns(550)
 	db.SetMaxIdleConns(550)
 
@@ -384,12 +443,19 @@ func main() {
 		os.Exit(1)
 	}
 
+	rdb := newRedisClient()
+	if err := rdb.Ping(context.Background()).Err(); err != nil {
+		fmt.Println("Cannot connect to Redis:", err)
+		fmt.Println("Set REDIS_HOST / REDIS_PORT env vars if needed, or run: docker compose up -d")
+		os.Exit(1)
+	}
+	rs := newRedisSync(rdb)
+
 	if *bench {
-		runBench(db, []int{50, 100, 200, 300, 400, 500})
+		runBench(db, rdb, rs, []int{50, 100, 200, 300, 400, 500})
 		return
 	}
 
-	// Interactive single-run mode
 	strategy := chooseStrategy()
 	fmt.Printf("\nUsing strategy: %s\n", strategy)
 
@@ -397,11 +463,22 @@ func main() {
 		fmt.Println("Failed to reset seats:", err)
 		os.Exit(1)
 	}
+	if strategy == RedisLock {
+		clearRedisLock(rdb)
+	}
 
 	fmt.Printf("Firing 100 concurrent booking requests...\n\n")
-	results, elapsed := runBookings(db, 100, strategy)
+	results, elapsed := runBookings(db, rs, 100, strategy)
 	booked, noSeat, failed := countResults(results)
 	fmt.Printf("Booked: %d | No seat available: %d | Errors: %d | Time: %s\n",
 		booked, noSeat, failed, elapsed.Round(time.Millisecond))
+	if failed > 0 {
+		for _, r := range results {
+			if r.Err != nil {
+				fmt.Printf("  sample error (customer %d): %v\n", r.CustomerID, r.Err)
+				break
+			}
+		}
+	}
 	printGrid(db)
 }
